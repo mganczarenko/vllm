@@ -5460,29 +5460,39 @@ class GPUModelRunner(
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
             # to gather the logprob for.
             tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
 
-            # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
+            # Compute prompt logprobs in chunks to bound peak VRAM usage.
+            # Materializing [num_logits, vocab_size] fp32 in one shot OOMs on
+            # long 5-shot prompts (e.g. 2000 tokens * 32768 vocab * 6 bytes
+            # = 375 MiB peak). CHUNK_SIZE=1024 caps peak at ~225 MiB.
+            _LOGPROB_CHUNK_SIZE = 1024
+            for chunk_start in range(0, num_logits, _LOGPROB_CHUNK_SIZE):
+                chunk_end = min(chunk_start + _LOGPROB_CHUNK_SIZE, num_logits)
+                chunk_hidden = hidden_states[offset + chunk_start : offset + chunk_end]
+                logits = self.model.compute_logits(chunk_hidden)
+                logprobs = self.sampler.compute_logprobs(logits)
+                token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+                    logprobs,
+                    num_prompt_logprobs,
+                    tgt_token_ids[chunk_start:chunk_end],
+                )
 
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+                # Transfer GPU->CPU async.
+                chunk_slice = slice(start_idx + chunk_start, start_idx + chunk_end)
+                logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                    token_ids, non_blocking=True
+                )
+                logprobs_tensors.logprobs[chunk_slice].copy_(
+                    logprobs, non_blocking=True
+                )
+                logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                    ranks, non_blocking=True
+                )
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
