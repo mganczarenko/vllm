@@ -2324,7 +2324,7 @@ def get_samples(
         ):
             # multi-modal benchmark is only available on chat-style backends;
             # which ones are allowed is caller-controlled (serve uses the
-            # OpenAI endpoints, throughput uses vllm-chat).
+            # OpenAI endpoints, throughput uses its offline vLLM backends).
             raise ValueError(
                 f"Multi-modal content is not supported on backend "
                 f"{args.backend!r}; use one of {sorted(multimodal_backends)}."
