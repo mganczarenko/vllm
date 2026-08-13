@@ -3,9 +3,9 @@
 """Tests for ``vllm bench throughput`` CLI.
 
 Throughput reuses ``bench serve``'s ``datasets.get_samples`` dispatch; the
-LoRA-assignment and MMVU cases below cover the pieces that are throughput-only
-(serve has no analogue), keeping the two benchmarks aligned without duplicating
-serve-side dataset coverage.
+LoRA-assignment, MMVU-resolution, and backend-gate cases below cover the
+pieces that are throughput-only (serve has no analogue), keeping the two
+benchmarks aligned without duplicating serve-side dataset coverage.
 """
 
 import subprocess
@@ -178,8 +178,46 @@ def test_assign_loras_random_in_range() -> None:
 
 
 # -----------------------------
-# Issue #50838: MMVU via throughput
+# HF dataset resolution via get_requests
 # -----------------------------
+
+
+def _stub_hf_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    attr: str,
+    paths,
+    *,
+    is_multimodal: bool,
+    multi_modal_data: object = None,
+) -> None:
+    """Monkeypatch a datasets.py HF dataset class with a network-free stub."""
+    import vllm.benchmarks.datasets.datasets as dsmod
+
+    class _Stub:
+        IS_MULTIMODAL = is_multimodal
+        SUPPORTED_DATASET_PATHS = paths
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def sample(self, *, num_requests, tokenizer, **kwargs):  # noqa: ARG002
+            return [
+                SampleRequest(
+                    prompt="q",
+                    prompt_len=1,
+                    expected_output_len=1,
+                    multi_modal_data=multi_modal_data,
+                )
+                for _ in range(num_requests)
+            ]
+
+    monkeypatch.setattr(dsmod, attr, _Stub)
+
+
+def _parse_throughput_args(*argv: str):
+    parser = FlexibleArgumentParser()
+    add_cli_args(parser)
+    return parser.parse_args(list(argv))
 
 
 @pytest.mark.benchmark
@@ -194,39 +232,58 @@ def test_get_requests_resolves_mmvu(
     download is stubbed so the resolution + dispatch path is exercised without
     network access.
     """
-    import vllm.benchmarks.datasets.datasets as dsmod
-
-    class _StubMMVUDataset:
-        # MMVU is multimodal in content but, like the real class, does not set
-        # IS_MULTIMODAL -- so it is not subject to the backend gate.
-        IS_MULTIMODAL = False
-        SUPPORTED_DATASET_PATHS = {"yale-nlp/MMVU": lambda x: x["question"]}
-
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-
-        def sample(self, *, num_requests, tokenizer, **kwargs):  # noqa: ARG002
-            return [
-                SampleRequest(prompt="q", prompt_len=1, expected_output_len=1)
-                for _ in range(num_requests)
-            ]
-
-    monkeypatch.setattr(dsmod, "MMVUDataset", _StubMMVUDataset)
-
-    parser = FlexibleArgumentParser()
-    add_cli_args(parser)
-    args = parser.parse_args(
-        [
-            "--dataset-name",
-            "hf",
-            "--dataset-path",
-            "yale-nlp/MMVU",
-            "--backend",
-            "vllm-chat",
-            "--num-prompts",
-            "3",
-        ]
+    # MMVU is multimodal in content but, like the real class, does not set
+    # IS_MULTIMODAL -- so it is not subject to the backend gate.
+    _stub_hf_dataset(
+        monkeypatch,
+        "MMVUDataset",
+        {"yale-nlp/MMVU": lambda x: x["question"]},
+        is_multimodal=False,
+    )
+    args = _parse_throughput_args(
+        "--dataset-name",
+        "hf",
+        "--dataset-path",
+        "yale-nlp/MMVU",
+        "--backend",
+        "vllm-chat",
+        "--num-prompts",
+        "3",
     )
     requests = get_requests(args, hf_tokenizer)
     assert len(requests) == 3
     assert all(isinstance(r, SampleRequest) for r in requests)
+
+
+@pytest.mark.benchmark
+def test_get_requests_allows_multimodal_on_plain_vllm_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    hf_tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    """Regression: --backend vllm must accept multimodal datasets such as ASR.
+
+    _run_vllm_requests forwards multi_modal_data straight to LLM.generate, so
+    the vllm-chat-only gate in get_samples rejected a backend that always
+    worked.
+    """
+    audio_content = {"audio": ("y", 16000)}
+    _stub_hf_dataset(
+        monkeypatch,
+        "ASRDataset",
+        {"openslr/librispeech_asr"},
+        is_multimodal=True,
+        multi_modal_data=audio_content,
+    )
+    args = _parse_throughput_args(
+        "--dataset-name",
+        "hf",
+        "--dataset-path",
+        "openslr/librispeech_asr",
+        "--backend",
+        "vllm",
+        "--num-prompts",
+        "3",
+    )
+    requests = get_requests(args, hf_tokenizer)
+    assert len(requests) == 3
+    assert all(r.multi_modal_data == audio_content for r in requests)
