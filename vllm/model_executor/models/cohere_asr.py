@@ -572,6 +572,7 @@ class ConvSubsampling(nn.Module):
                 "subsampling_conv_chunking_factor should be -1, 1, or a power of 2"
             )
 
+        self.conv_channels = conv_channels
         in_channels = 1
         layers = []
 
@@ -671,7 +672,7 @@ class ConvSubsampling(nn.Module):
     def forward(
         self, x: torch.Tensor, lengths: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x, lengths = self.conv(x, lengths)
+        x, lengths = self._conv_forward_chunked(x, lengths)
 
         if self.conv2d_subsampling:
             b, c, t, f = x.size()
@@ -681,6 +682,58 @@ class ConvSubsampling(nn.Module):
             x = x.transpose(1, 2)
 
         return x, lengths
+
+    def _conv_forward_chunked(
+        self, x: torch.Tensor, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the conv stack over `x`'s batch dim in memory-safe chunks.
+
+        The scheduler admits requests by token/cache budget, which has no
+        notion of how many distinct items get padded together into one
+        conv2d call here. A burst of concurrently-admitted items can pad to
+        a large batch x time shape and blow past free device memory in a
+        single allocation. Splitting the batch into sub-chunks that fit the
+        currently free memory keeps peak activation size bounded regardless
+        of how many items the scheduler let through this step.
+        """
+        batch_size = x.size(0)
+        if batch_size <= 1:
+            return self.conv(x, lengths)
+
+        chunk_size = self._safe_conv_batch_size(x)
+        if chunk_size >= batch_size:
+            return self.conv(x, lengths)
+
+        out_chunks = []
+        len_chunks = []
+        for start in range(0, batch_size, chunk_size):
+            end = min(start + chunk_size, batch_size)
+            out_chunk, len_chunk = self.conv(x[start:end], lengths[start:end])
+            out_chunks.append(out_chunk)
+            len_chunks.append(len_chunk)
+        return torch.cat(out_chunks, dim=0), torch.cat(len_chunks, dim=0)
+
+    def _safe_conv_batch_size(self, x: torch.Tensor) -> int:
+        """Estimate how many items of `x` the conv stack can process at once
+        without exceeding currently free device memory.
+
+        Rough estimate: peak intermediate activation size for this conv
+        stack is dominated by the first layer's output, sized
+        (B, conv_channels, T, F) in the input dtype, times a small
+        multiplier for the mask/activation copies made along the way.
+        """
+        if not torch.accelerator.is_available():
+            return x.size(0)
+        free_bytes, _total = torch.accelerator.get_memory_info(x.device)
+
+        _, _, t, f = x.unsqueeze(1).shape
+        bytes_per_item = self.conv_channels * t * f * x.element_size()
+        # Leave headroom for everything else running concurrently
+        # (KV cache, decoder activations, other requests' encoder chunks).
+        activation_multiplier = 4
+        usable_bytes = free_bytes * 0.5
+        safe_batch = int(usable_bytes // (bytes_per_item * activation_multiplier))
+        return max(1, min(x.size(0), safe_batch))
 
 
 class PositionalEncoding(torch.nn.Module):
